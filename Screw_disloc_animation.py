@@ -2,20 +2,21 @@
 PyVista animation for a *screw-like* dislocation visualization (3D -> 2D -> zoom-out).
 
 Sequence requested:
-1) Start with atoms as big points, then shrink until they "disappear" (lines can remain).
+1) Start with atoms as big points, then shrink until they "disappear".
+   As the points get very small, switch to showing ONLY the *surface* of the lattice (no interior points/lines).
 2) Highlight the dislocation line.
-3) Perform the shearing motion, then restore points to original size.
+3) Perform the shearing motion (surface-only view), then restore the full lattice and grow points back to original size.
 4) Move camera into a 2D view (orthographic) on the plane normal to the dislocation line.
 5) "Zoom out" by stepping through larger lattices (more atoms in view), similar to the edge-dislocation animation.
 
 Update (stress coloring):
-- Coloring is now based on the *isotropic elasticity* stress field of an ideal screw dislocation.
+- Coloring is based on the *isotropic elasticity* stress field of an ideal screw dislocation.
 - For a screw with line || z, the only non-zero components are σ_xz and σ_yz (up to symmetry).
-  We compute them from u3 = (b/2π) atan(x2/x1), and σ = μ * grad(u_parallel) in the perpendicular plane.
+  We compute them from u_parallel = (b/2π) atan(p2/p1), and σ = μ * grad(u_parallel) in the perpendicular plane.
 - By default we use μ=1 (matching Atomsk's convention when μ is unknown: the code is effectively σ/μ).
 
 Run:
-  python Screw_dislocation_animation_sequence_zoomout_stress.py
+  python Screw_dislocation_animation_sequence_zoomout_stress_surface_shell.py
 
 Headless Linux/HPC:
 - If you get a VTK/X server error, uncomment `pv.start_xvfb()`.
@@ -193,9 +194,14 @@ def parallel_scale_from_bounds(bounds, line_axis: str) -> float:
 def point_size_from_counts(N_total: int) -> float:
     # Bigger points to reduce white space
     N0 = 8 * 8 * 5
-    base = 250.0
+    base = 120.0
     ps = base * np.sqrt(N0 / max(N_total, 1))
     return float(np.clip(ps, 10.0, 140.0))
+
+
+def smoothstep01(x: float) -> float:
+    x = float(np.clip(x, 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
 
 
 def set_actor_opacity(actor, opacity: float):
@@ -263,6 +269,61 @@ def camera_target_for_axis(bounds, line_axis: str, dist_factor: float = 6.0):
 # ------------------------------------------------------------
 # Scene construction
 # ------------------------------------------------------------
+def _surface_mask_indices(Nx: int, Ny: int, Nz: int) -> np.ndarray:
+    """Boolean mask of points on the outer faces of an Nx-by-Ny-by-Nz grid."""
+    base_per_layer = Nx * Ny
+    N_total = Nz * base_per_layer
+    idx = np.arange(N_total, dtype=np.int64)
+    k = idx // base_per_layer
+    rem = idx - k * base_per_layer
+    j = rem // Nx
+    i = rem - j * Nx
+    surf = (i == 0) | (i == Nx - 1) | (j == 0) | (j == Ny - 1) | (k == 0) | (k == Nz - 1)
+    return surf
+
+
+def _surface_lines(Nx: int, Ny: int, Nz: int, surf_mask: np.ndarray) -> np.ndarray:
+    """
+    Build line connectivity but only for edges that lie on the surface (both endpoints are surface points).
+    """
+    base_per_layer = Nx * Ny
+    N_total = Nz * base_per_layer
+
+    # map old index -> new surface index
+    old_to_new = -np.ones(N_total, dtype=np.int64)
+    surf_idx = np.where(surf_mask)[0]
+    old_to_new[surf_idx] = np.arange(surf_idx.size, dtype=np.int64)
+
+    pairs: list[tuple[int, int]] = []
+
+    def add_if_surface(i0: int, i1: int):
+        n0 = old_to_new[i0]
+        n1 = old_to_new[i1]
+        if n0 >= 0 and n1 >= 0:
+            pairs.append((int(n0), int(n1)))
+
+    # in-layer neighbors (x and y)
+    for k in range(Nz):
+        off = k * base_per_layer
+        for j in range(Ny):
+            row = off + j * Nx
+            for i in range(Nx):
+                idx0 = row + i
+                if i + 1 < Nx:
+                    add_if_surface(idx0, idx0 + 1)
+                if j + 1 < Ny:
+                    add_if_surface(idx0, idx0 + Nx)
+
+    # between layers (z links)
+    for k in range(Nz - 1):
+        off0 = k * base_per_layer
+        off1 = (k + 1) * base_per_layer
+        for p in range(base_per_layer):
+            add_if_surface(off0 + p, off1 + p)
+
+    return _lines_from_pairs(pairs)
+
+
 def build_scene_screw(
     N_xy: int,
     a: float = 1.0,
@@ -295,7 +356,7 @@ def build_scene_screw(
     Nz = choose_Nz(Nx, Ny)
 
     if shear_step is None:
-        shear_step = 0.5 * a
+        shear_step = 1 * a
     if shear_w is None:
         shear_w = 0.15 * a
     if y_w is None:
@@ -307,7 +368,7 @@ def build_scene_screw(
     y = (np.arange(Ny) - (Ny - 1) / 2) * a
     X, Y = np.meshgrid(x, y, indexing="xy")
 
-    z = (np.arange(Nz) - (Nz - 1) / 2) * a * z_scale
+    z = (np.arange(Nz) - (Nz - 1) / 2) * a #* z_scale
 
     base_per_layer = Nx * Ny
     N_total = Nz * base_per_layer
@@ -323,7 +384,7 @@ def build_scene_screw(
     gate_y = 0.5 * (1.0 + np.tanh((Y - core_y) / y_w))      # ~0 below, ~1 above
     gate_y *= np.exp(-np.clip(Y - core_y, 0.0, None) / decay_y)
 
-    d_2d = -shear_step * split_x * gate_y                    # signed magnitude
+    d_2d = -shear_step * split_x * gate_y                   # signed magnitude (flip sign to swap front/back)
 
     pts_def = pts_perf.copy()
     ax = line_axis.lower()
@@ -336,7 +397,7 @@ def build_scene_screw(
     else:
         raise ValueError("line_axis must be one of {'x','y','z'}")
 
-    # --- stresses (theory) ---
+    # --- stresses (theory) computed on the *perfect* coordinates ---
     rx = pts_perf[:, 0] - core_x
     ry = pts_perf[:, 1] - core_y
     rz = pts_perf[:, 2] - core_z
@@ -354,18 +415,18 @@ def build_scene_screw(
         smax = float(max(smax, 1e-30))
         clim = (-smax, smax)
 
-    # Lines: x,y neighbors within layers + between layers
+    # Lines: full lattice connectivity (x,y neighbors within layers + between layers)
     pairs: list[tuple[int, int]] = []
     for k in range(Nz):
         off = k * base_per_layer
         for j in range(Ny):
             row = off + j * Nx
             for i in range(Nx):
-                idx = row + i
+                idx0 = row + i
                 if i + 1 < Nx:
-                    pairs.append((idx, idx + 1))
+                    pairs.append((idx0, idx0 + 1))
                 if j + 1 < Ny:
-                    pairs.append((idx, idx + Nx))
+                    pairs.append((idx0, idx0 + Nx))
 
     for k in range(Nz - 1):
         off0 = k * base_per_layer
@@ -373,7 +434,15 @@ def build_scene_screw(
         for p in range(base_per_layer):
             pairs.append((off0 + p, off1 + p))
 
-    lines = _lines_from_pairs(pairs)
+    lines_full = _lines_from_pairs(pairs)
+
+    # Surface subset + surface-only lines
+    surf_mask = _surface_mask_indices(Nx, Ny, Nz)
+    pts_perf_surf = pts_perf[surf_mask]
+    pts_def_surf = pts_def[surf_mask]
+    scalar_surf = scalar[surf_mask]
+    lines_surf = _surface_lines(Nx, Ny, Nz, surf_mask)
+
     point_size = point_size_from_counts(N_total)
 
     return {
@@ -381,14 +450,17 @@ def build_scene_screw(
         "Nx": Nx, "Ny": Ny, "Nz": Nz,
         "pts_perf": pts_perf,
         "pts_def": pts_def,
-        "sigma_c1": c1,
-        "sigma_c2": c2,
-        "scalar": scalar,
+        "lines_full": lines_full,
+        "pts_perf_surf": pts_perf_surf,
+        "pts_def_surf": pts_def_surf,
+        "lines_surf": lines_surf,
+        "scalar_full": scalar,
+        "scalar_surf": scalar_surf,
         "scalar_name": scalar_name,
         "clim": clim,
-        "lines": lines,
         "point_size": point_size,
         "bounds_def": scene_bounds(pts_def),
+        "bounds_def_surf": scene_bounds(pts_def_surf),
     }
 
 
@@ -407,29 +479,29 @@ def main():
     mu = 1.0                 # set to 1.0 to mimic Atomsk's σ/μ convention
 
     # "zoom-out" sizes (increasing FOV / more atoms in view)
-    sizes = [N_start, 12, 16, 20, 28, 38, 48, 68, 96]
+    sizes = [N_start, 16, 32, 48, 64]
 
-    out_mp4 = "screw_dislocation_sequence_stress_c2.mp4"
-    out_gif = "screw_dislocation_sequence_stress.gif"
+    out_mp4 = "screw_dislocation_sequence_stress_surface.mp4"
+    out_gif = "screw_dislocation_sequence_stress_surface.gif"
 
     # Timing (frames)
     fps = 60
 
-    hold_big = 35
-    shrink_frames = 90
+    hold_big = 60
+    shrink_frames = 120
 
-    line_fade_in = 40
-    line_hold = 25
+    line_fade_in = 60
+    line_hold = 45
 
-    shear_frames = 200
-    grow_frames = 80
+    shear_frames = 180
+    grow_frames = 60
 
-    cam_move_frames = 90
+    cam_move_frames = 120
     fade_to_color = 60
 
-    zoom_fade = 90
+    zoom_fade = 210
     hold_each = 0
-    final_hold = 180
+    final_hold = 360
 
     # Build first scene
     s0 = build_scene_screw(N_start, line_axis=line_axis, stress_mode=stress_mode, mu=mu)
@@ -440,14 +512,13 @@ def main():
     # Start in 3D perspective
     set_camera_3d(plotter, s0["bounds_def"], view_angle=30.0)
 
-    # PolyData
+    # -------- Full lattice PolyData + actors --------
     poly = pv.PolyData(s0["pts_perf"])
-    poly["scalar"] = s0["scalar"]
+    poly["scalar"] = s0["scalar_full"]
 
     line_poly = pv.PolyData(s0["pts_perf"].copy())
-    line_poly.lines = s0["lines"]
+    line_poly.lines = s0["lines_full"]
 
-    # Actors: points (blue + colored) and lattice lines
     a_blue = plotter.add_mesh(
         poly,
         color="tab:blue",
@@ -472,6 +543,42 @@ def main():
         color="black",
         opacity=0.18,
         line_width=1.3,
+    )
+
+    # -------- Surface-only PolyData + actors (start hidden) --------
+    poly_surf = pv.PolyData(s0["pts_perf_surf"])
+    poly_surf["scalar"] = s0["scalar_surf"]
+
+    line_poly_surf = pv.PolyData(s0["pts_perf_surf"].copy())
+    line_poly_surf.lines = s0["lines_surf"]
+
+    a_blue_surf = plotter.add_mesh(
+        poly_surf,
+        color="tab:blue",
+        style="points",
+        render_points_as_spheres=True,
+        point_size=max(2.0, 0.12 * s0["point_size"]),
+        opacity=0.0,
+    )
+    a_lines_surf = plotter.add_mesh(
+        line_poly_surf,
+        color="black",
+        opacity=0.0,
+        line_width=1.6,
+    )
+
+    # -------- Opaque surface shell (to occlude interior) --------
+    grid = pv.StructuredGrid()
+    grid.dimensions = (s0["Nx"], s0["Ny"], s0["Nz"])
+    grid.points = s0["pts_perf"]
+    surf_mesh = grid.extract_surface(pass_pointid=True)
+    surf_ids = surf_mesh.point_data["vtkOriginalPointIds"]
+
+    a_shell = plotter.add_mesh(
+        surf_mesh,
+        color="white",
+        opacity=0.0,
+        smooth_shading=False,
     )
 
     # Dislocation line actor (highlight)
@@ -520,24 +627,54 @@ def main():
         frame()
 
     # ------------------------------------------------------------
-    # (1b) Shrink points until they "disappear" (keep lines)
+    # (1b) Shrink points until they "disappear"
+    #      As they become tiny, switch to *surface-only* view (no interior).
     # ------------------------------------------------------------
     ps0 = s0["point_size"]
     ps_min = 0.1
+    ps_shell = max(2.0, 0.12 * ps0)
+
     for k in range(shrink_frames):
         t = k / (shrink_frames - 1)
+
+        # full points shrink and fade out
         ps = (1.0 - t) * ps0 + t * ps_min
         set_actor_point_size(a_blue, ps)
         set_actor_point_size(a_col, ps)
         set_actor_opacity(a_blue, 1.0 - t)
-        set_actor_opacity(a_col, 0.0)
-        set_actor_opacity(a_lines, 0.18 + 0.10 * t)
+        set_actor_opacity(a_col, 0.0)  # keep hidden until later
+
+        # surface-only fades in late in this phase
+        shell_t = smoothstep01((t - 0.55) / 0.45)
+        set_actor_point_size(a_blue_surf, ps_shell)
+        set_actor_opacity(a_blue_surf, shell_t)
+        set_actor_opacity(a_shell, shell_t)
+
+        # lines: crossfade full -> surface lines
+        set_actor_opacity(a_lines, 0.18 * (1.0 - shell_t))
+        set_actor_opacity(a_lines_surf, 0.22 * shell_t)
+
         frame()
 
+    # lock: full is off, surface is on
     set_actor_opacity(a_blue, 0.0)
+    set_actor_opacity(a_lines, 0.0)
+    set_actor_opacity(a_blue_surf, 1.0)
+    set_actor_opacity(a_lines_surf, 0.22)
+    set_actor_opacity(a_shell, 1.0)
+    # remove full-lattice actors entirely to guarantee surface-only rendering
+    if a_blue is not None:
+        plotter.remove_actor(a_blue)
+    if a_col is not None:
+        plotter.remove_actor(a_col)
+    if a_lines is not None:
+        plotter.remove_actor(a_lines)
+    a_blue = None
+    a_col = None
+    a_lines = None
 
     # ------------------------------------------------------------
-    # (2) Highlight dislocation line
+    # (2) Highlight dislocation line (keep surface-only)
     # ------------------------------------------------------------
     for k in range(line_fade_in):
         t = k / (line_fade_in - 1)
@@ -548,33 +685,94 @@ def main():
         frame()
 
     # ------------------------------------------------------------
-    # (3) Shear motion (show via lines; points still tiny/invisible)
+    # (3) Shear motion (surface-only points + surface lines)
     # ------------------------------------------------------------
-    s_shear = s0
     for k in range(shear_frames):
         t = k / (shear_frames - 1)
-        pts = lerp(s_shear["pts_perf"], s_shear["pts_def"], t)
-        poly.points = pts
-        line_poly.points = pts
+        pts_s = lerp(s0["pts_perf_surf"], s0["pts_def_surf"], t)
+        poly_surf.points = pts_s
+        line_poly_surf.points = pts_s
+        pts_full = lerp(s0["pts_perf"], s0["pts_def"], t)
+        surf_mesh.points = pts_full[surf_ids]
         if k % 12 == 0:
             plotter.reset_camera_clipping_range()
         frame()
 
     # ------------------------------------------------------------
-    # (3b) Grow points back to original size
+    # (3b) Restore the FULL lattice (already sheared) and grow points back
     # ------------------------------------------------------------
+    # set full geometry to the sheared state before fading in
+    poly.points = s0["pts_def"]
+    line_poly.points = s0["pts_def"]
+
+    # re-add full actors for the fade-in
+    a_blue = plotter.add_mesh(
+        poly,
+        color="tab:blue",
+        style="points",
+        render_points_as_spheres=True,
+        point_size=s0["point_size"],
+        opacity=0.0,
+    )
+    a_col = plotter.add_mesh(
+        poly,
+        scalars="scalar",
+        cmap="coolwarm",
+        clim=s0["clim"],
+        show_scalar_bar=False,
+        style="points",
+        render_points_as_spheres=True,
+        point_size=s0["point_size"],
+        opacity=0.0,
+    )
+    a_lines = plotter.add_mesh(
+        line_poly,
+        color="black",
+        opacity=0.0,
+        line_width=1.3,
+    )
+
+    # start full invisible and tiny
+    set_actor_point_size(a_blue, ps_min)
+    set_actor_point_size(a_col, ps_min)
+    set_actor_opacity(a_blue, 0.0)
+    set_actor_opacity(a_col, 0.0)
+
+    # fade: surface -> full, grow point sizes
     for k in range(grow_frames):
         t = k / (grow_frames - 1)
+
         ps = (1.0 - t) * ps_min + t * ps0
         set_actor_point_size(a_blue, ps)
         set_actor_point_size(a_col, ps)
-        set_actor_opacity(a_blue, t)   # bring back blue points
-        set_actor_opacity(a_lines, (1.0 - t) * 0.28 + t * 0.18)
+
+        # full fades in
+        set_actor_opacity(a_blue, t)
+        # keep colored hidden until later (2D stage)
+        set_actor_opacity(a_col, 0.0)
+
+        # surface fades out
+        set_actor_opacity(a_blue_surf, 1.0 - t)
+        set_actor_opacity(a_lines_surf, 0.22 * (1.0 - t))
+        set_actor_opacity(a_shell, 1.0 - t)
+
+        # full lines fade back in
+        set_actor_opacity(a_lines, 0.18 * t)
+
+        # keep dislocation line visible during this phase
         set_actor_opacity(a_disl, 1.0)
+
         frame()
 
+    # lock: full on, surface off
     set_actor_opacity(a_blue, 1.0)
     set_actor_opacity(a_lines, 0.18)
+    set_actor_opacity(a_blue_surf, 0.0)
+    set_actor_opacity(a_lines_surf, 0.0)
+    set_actor_opacity(a_shell, 0.0)
+    a_blue_surf.SetVisibility(False)
+    a_lines_surf.SetVisibility(False)
+    a_shell.SetVisibility(False)
 
     # ------------------------------------------------------------
     # (4) Move camera to 2D view normal to dislocation line
@@ -598,7 +796,9 @@ def main():
         plotter.camera.up = up_tgt
         plotter.camera.view_angle = float((1.0 - t) * 30.0 + t * 18.0)
 
+        # fade dislocation line out during camera move
         set_actor_opacity(a_disl, 1.0 - t)
+
         if k % 10 == 0:
             plotter.reset_camera_clipping_range()
         frame()
@@ -643,10 +843,10 @@ def main():
         s = build_scene_screw(N_xy, line_axis=line_axis, stress_mode=stress_mode, mu=mu)
 
         poly_n = pv.PolyData(s["pts_def"])
-        poly_n["scalar"] = s["scalar"]
+        poly_n["scalar"] = s["scalar_full"]
 
         line_poly_n = pv.PolyData(s["pts_def"].copy())
-        line_poly_n.lines = s["lines"]
+        line_poly_n.lines = s["lines_full"]
 
         a_col_n = plotter.add_mesh(
             poly_n,
